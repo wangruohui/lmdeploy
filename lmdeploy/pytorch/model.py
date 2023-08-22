@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .accel import replace_layer
 from .dist import get_local_rank
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,9 @@ def accel_model(model,
         # user is responsible to assign the gpu id via CUDA_VISIBLE_DEVICES # noqa: E501
         gpu_id = gpu_id if gpu_id is not None else get_local_rank()
         model = model.cuda(gpu_id)
+    elif accel.lower() == 'replace_layer':
+        # Use layer replacement to accelerate
+        model = replace_layer(model)
 
     elif accel.lower() == 'deepspeed':
         # Use deepspeed inference inject fast kernel and/or tensor parallel
@@ -154,6 +158,6 @@ def accel_model(model,
     else:
         raise ValueError(f'Unsupported accelerator {accel}.')
 
-    logger.debug(model)
+    logger.debug(f'Model after raplacement:\n{model}')
 
     return model
