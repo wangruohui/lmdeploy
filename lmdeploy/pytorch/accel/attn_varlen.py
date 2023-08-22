@@ -1,17 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import flash_attn
-import flash_attn_2_cuda as flash_attn_cuda
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import xformers
 import xformers.ops as xops
-from einops import einsum, rearrange
-from transformers.models.llama.modeling_llama import (LlamaAttention,
-                                                      LlamaConfig)
-from xformers.ops.common import get_xformers_operator
-from xformers.ops.fmha import cutlass
-from xformers.ops.fmha.common import Inputs
 
 from .rot_emb import triton_rotate_half_
 
@@ -43,7 +33,6 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         past_key_value=None,
         use_cache=False,
         mode='decode',
-        # varlen=False,
         **kwargs,
     ):
         """Forward function.
