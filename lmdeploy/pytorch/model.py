@@ -102,6 +102,7 @@ def accel_model(model,
         model = model.cuda(gpu_id)
     elif accel.lower() == 'replace_layer':
         # Use layer replacement to accelerate
+        model = model.cuda(gpu_id)
         model = replace_layer(model)
 
     elif accel.lower() == 'deepspeed':

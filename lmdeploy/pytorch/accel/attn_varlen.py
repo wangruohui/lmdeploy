@@ -1,17 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import flash_attn
-import flash_attn_2_cuda as flash_attn_cuda
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import xformers
 import xformers.ops as xops
-from einops import einsum, rearrange
-from transformers.models.llama.modeling_llama import (LlamaAttention,
-                                                      LlamaConfig)
-from xformers.ops.common import get_xformers_operator
-from xformers.ops.fmha import cutlass
-from xformers.ops.fmha.common import Inputs
 
 from .rot_emb import triton_rotate_half_
 
@@ -22,7 +12,8 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         super().__init__()
 
         # currently support this only
-        assert orig.__class__.__name__ == 'LlamaAttention', f'{orig.__class__.__name__} not supported.'
+        assert orig.__class__.__name__ == 'LlamaAttention', \
+            f'{orig.__class__.__name__} not supported.'
 
         self.qkv_mat = nn.Parameter(
             torch.stack(
@@ -42,7 +33,6 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         past_key_value=None,
         use_cache=False,
         mode='decode',
-        # varlen=False,
         **kwargs,
     ):
         """Forward function.
@@ -52,14 +42,18 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         Args:
             hidden_states: (bs, seqlen, head * dim)
             position_ids: (bs, seqlen), position ids for rotary embedding
-            past_key_value: (k_cache, v_cache), tuple of (bs, cachelen, head, dim)
+            past_key_value: tuple of (k_cache, v_cache), each of shape
+                (bs, cachelen, head, dim)
         """
-        print(f'attention_mask = {attention_mask}')
+        # print(f'attention_mask = {attention_mask}')
+        # print(f'position_ids.shape in VarLenAttn = {position_ids.shape}')
         bs, seqlen, _ = hidden_states.shape
-        cachelen = (past_key_value[0].shape[2] if
-                    (use_cache and past_key_value is not None) else 0)
+        # cachelen = (
+        #     past_key_value[0].shape[2] if
+        #     (use_cache and past_key_value is not None) else 0)
 
-        assert position_ids.shape == (bs, seqlen)
+        assert position_ids.shape == (
+            bs, seqlen), f'position_ids.shape = {position_ids.shape}'
 
         # QKV Gemm
         qkv = torch.einsum('bsh,toh->bsto', hidden_states, self.qkv_mat)
@@ -72,9 +66,9 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         # Split QKV
         q, k, v = torch.unbind(qkv, dim=2)
 
-        print(f'q.shape = {q.shape}')
-        print(f'k.shape = {k.shape}')
-        print(f'v.shape = {v.shape}')
+        # print(f'q.shape = {q.shape}')
+        # print(f'k.shape = {k.shape}')
+        # print(f'v.shape = {v.shape}')
 
         if mode == 'decode':
             output = xops.memory_efficient_attention_forward(
@@ -84,7 +78,7 @@ class MemoryEfficientAttentionVarlen(nn.Module):
                 attn_bias=attention_mask,
             )
         else:
-            raise NotImplemented
+            raise NotImplementedError
 
         # print(f"output.shape = {output.shape}")
         # O proj

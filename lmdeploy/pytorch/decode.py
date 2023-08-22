@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (AutoTokenizer, PreTrainedModel,
                           PreTrainedTokenizerBase)
+from xformers.ops.fmha.attn_bias import AttentionBias, BlockDiagonalMask
 
 from .model import accel_model, init_model
 
@@ -52,6 +53,8 @@ def avail_gpus(percentage=0.96):
 @torch.no_grad()
 def decode_single(model: PreTrainedModel,
                   input_ids: torch.Tensor,
+                  input_lens: List[int],
+                  position_ids: torch.Tensor = None,
                   attention_mask: torch.Tensor = None):
     """Decode a single batch.
 
@@ -71,7 +74,11 @@ def decode_single(model: PreTrainedModel,
     """
 
     # Call Causal LM forward
+    print(f'input_ids.shape in decode single = {input_ids.shape}')
+    # print(f"attention_mask.shape in decode single = {attention_mask.shape}")
+    # print(f"attention_mask.shape in decode single = {attention_mask.shape}")
     outputs = model(input_ids=input_ids,
+                    position_ids=position_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=False,
                     output_attentions=False,
@@ -89,12 +96,27 @@ def decode_single(model: PreTrainedModel,
     shift_probs = logits[..., :-1, :].contiguous()
     probs = torch.gather(shift_probs, -1, shift_labels.unsqueeze(-1))
 
-    probs = probs.squeeze(-1)
+    probs = probs.squeeze(-1)  # [bs, seqlen]
 
-    if attention_mask is not None:
+    if isinstance(attention_mask, torch.Tensor):
+        # batched
         probs *= attention_mask[..., 1:]
+        probs = probs.cpu()
 
-    probs = probs.cpu()
+    elif isinstance(attention_mask, AttentionBias):
+        # packed
+        probs = probs.squeeze(0)
+        probs = probs.cpu()
+
+        # print(f"probs.shape = {probs.shape}")
+        start = 0
+        probs_list = []
+        for b in input_lens:
+            end = start + b
+            probs_list.append(probs[start:end - 1])
+            start = end
+
+        probs = probs_list  # list of Tensor
 
     return probs
 
@@ -116,22 +138,46 @@ def worker_fn(model_path: str,
             continue
 
         if input_ids is None:
+            print(f'Worker {gpu_id} received exit signal.')
             break
 
-        input_ids = input_ids.cuda(gpu_id)
-        max_len = max(input_lens)
-        assert max_len == input_ids.size(-1), \
-            f'input_ids.shape = {input_ids.shape}, max_len = {max_len}'
+        if accel is None:
+            # pad and pack input ids
+            input_ids = [torch.tensor(p) for p in input_ids]
+            input_ids = pad_sequence(input_ids, batch_first=True)
+            input_ids = input_ids.cuda(gpu_id)
 
-        input_lens = torch.tensor(input_lens, device=gpu_id)
-        attention_mask = torch.arange(
-            max_len, device=gpu_id)[None, :] < input_lens[:, None]
-        # attention_mask = inputs['attention_mask'].cuda(gpu_id)
+            # attention_mask [bs, max_len]
+            max_len = max(input_lens)
+            assert max_len == input_ids.size(-1), \
+                f'input_ids.shape = {input_ids.shape}, max_len = {max_len}'
 
-        assert attention_mask.shape == input_ids.shape, \
-            f'attention_mask.shape = {attention_mask.shape}'
+            input_lens = torch.tensor(input_lens, device=gpu_id)
+            attention_mask = torch.arange(
+                max_len, device=gpu_id)[None, :] < input_lens[:, None]
+
+            position_ids = None
+            assert attention_mask.shape == input_ids.shape, \
+                f'attention_mask.shape = {attention_mask.shape}'
+
+        elif accel == 'replace_layer':
+            # pack input ids
+            input_ids = torch.tensor(sum(input_ids, [])).unsqueeze(0)
+            input_ids = input_ids.cuda(gpu_id)
+            # print(f"input_ids.shape = {input_ids.shape}")
+            # input_ids.shape == [1, pack_len]
+
+            # attention bias for xformers
+            attention_mask = BlockDiagonalMask.from_seqlens(
+                input_lens, input_lens).make_causal()
+
+            position_ids = torch.cat(
+                [torch.arange(il, device=gpu_id) for il in input_lens])
+            position_ids = position_ids.unsqueeze(0)
+
         try:
-            probs = decode_single(model, input_ids, attention_mask)
+            probs = decode_single(model, input_ids, input_lens, position_ids,
+                                  attention_mask)
         except torch.cuda.OutOfMemoryError:
             warnings.warn(
                 f'OOM on GPU {gpu_id}, discard prompts at indics {idx}.')
@@ -141,6 +187,7 @@ def worker_fn(model_path: str,
 
         outq.put((idx, probs))
 
+    print(f'Exiting worker {gpu_id}.')
     inq.close()
     outq.close()
     print(f'Worker {gpu_id} finished.')
@@ -168,6 +215,8 @@ class Engine:
             Defaults to 2e6 (2MB).
             ``bytes_per_token`` and ``model_size_byte`` are used to compute
             the maximum batch size for given seq_length
+        max_bs (int, optional): Maximum batch size.
+                Defaults to 1024.
     """  # noqa: E501
 
     def __init__(self,
@@ -177,7 +226,8 @@ class Engine:
                  accel: Optional[str] = None,
                  gpu_mem_percentage: float = 0.96,
                  model_size_byte=14e9,
-                 bytes_per_token=2e6):
+                 bytes_per_token=2e6,
+                 max_bs: int = 1024):
 
         gpu_ids, mem = avail_gpus(gpu_mem_percentage)
         print(f'Available GPUs are: {gpu_ids}, ', end='')
@@ -206,6 +256,7 @@ class Engine:
         self.outq = outq
         self.ps = ps
         self.tokenizer = tokenizer
+        self.max_bs = max_bs
         self.safe_numel = safe_numel(mem, model_size_byte, bytes_per_token)
 
     def clear_queue(self):
@@ -213,11 +264,7 @@ class Engine:
             while not q.empty():
                 q.get()
 
-    def decode(self,
-               prompt_token_ids: List[List[int]],
-               sort=True,
-               max_bs: int = 1024,
-               pad=True):
+    def decode(self, prompt_token_ids: List[List[int]], sort=True, pad=True):
         """Inference the model to compute probabilities.
 
         Args:
@@ -225,8 +272,6 @@ class Engine:
             sort (bool, optional): Internally sort the prompts by length to achieve better efficiency.
                 Defaults to True.
                 Note: orders of returned probabilities are always the same as the input.
-            max_bs (int, optional): Maximum batch size.
-                Defaults to 1024.
             pad (bool, optional): Pad the prompts in every mini batch to the same length.
                 Defaults to True. Set to False to save memory.
 
@@ -234,7 +279,7 @@ class Engine:
             numpy.ndarray: List of probabilities of all prompts, with prob=0 padded.
                 If pad is True
             List[numpy.ndarray]: List of probabilities of all prompts without padding.
-                If pad is False, the result if a batch of tensor.
+                If pad is False
 
         Note:
             This function will accept input token_ids = [x0(=bos), x1, x2, ..., xn]
@@ -252,12 +297,12 @@ class Engine:
             prompts_and_indicis = list(enumerate(prompt_token_ids))
 
         left = 0
-        bs = max_bs
+        bs = self.max_bs
 
         while left < len(prompt_token_ids):
 
             if not sort:
-                bs = max_bs
+                bs = self.max_bs
 
             right = min(left + bs, len(prompt_token_ids))
 
@@ -267,20 +312,19 @@ class Engine:
 
             # batch of input_ids and attn_masks
             # inputs = self.tokenizer(sub_p, return_tensors='pt', padding=True)
-            input_ids = [torch.tensor(p) for p in sub_p]
-            input_ids = pad_sequence(input_ids, batch_first=True)
+            input_ids: List[List[int]] = sub_p
             input_lens = [len(p) for p in sub_p]
 
             # Dynamic batch size based on safe memory
-            while input_ids.numel() > self.safe_numel:
+            while sum(input_lens) > self.safe_numel:
                 if bs == 1:
                     break
                 bs = max(1, round(bs / 1.5))
                 print(f'\nReduce bs to {bs} when seq len reaches '
-                      f'{input_ids.shape[-1]}')
+                      f'{max(input_lens)}')
                 idx = idx[:bs]
                 input_lens = input_lens[:bs]
-                input_ids = input_ids[:bs, :max(input_lens)]
+                input_ids = input_ids[:bs]
 
             # Send to worker
             self.inq.put((idx, input_ids, input_lens))
@@ -316,6 +360,9 @@ class Engine:
             all_probs = all_probs.cpu().numpy()
         else:
             all_probs = [p.cpu().numpy() for p in all_probs]
+            for i, prompt in enumerate(prompt_token_ids):
+                len_ = len(prompt) - 1
+                all_probs[i] = all_probs[i][:len_]
 
         return all_probs
 
