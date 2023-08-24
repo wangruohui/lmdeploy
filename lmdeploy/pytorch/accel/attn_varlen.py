@@ -1,7 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch
-import torch.nn as nn
-import xformers.ops as xops
 import flash_attn
 import flash_attn_2_cuda as flash_attn_cuda
 import torch
