@@ -49,13 +49,13 @@ def avail_gpus(percentage=0.96):
     if len(gpus) == 0:
         raise RuntimeError('No GPU available.')
 
-    return gpus, sum(mems) / len(mems)
+    return gpus, mems
 
 
 @torch.no_grad()
 def decode_single(model: PreTrainedModel,
                   input_ids: torch.Tensor,
-                  input_lens: List[int],
+                  input_lens: List[int] = None,
                   attention_mask: torch.Tensor = None,
                   position_ids: torch.Tensor = None,
                   return_logits=True):
@@ -77,7 +77,7 @@ def decode_single(model: PreTrainedModel,
     """
 
     # Call Causal LM forward
-    print(f'input_ids.shape in decode single = {input_ids.shape}')
+    # print(f'input_ids.shape in decode single = {input_ids.shape}')
     # print(f"attention_mask.shape in decode single = {attention_mask.shape}")
     # print(f"attention_mask.shape in decode single = {attention_mask.shape}")
     outputs = model(input_ids=input_ids,
@@ -99,12 +99,17 @@ def decode_single(model: PreTrainedModel,
         shift_probs = logits[..., :-1, :].contiguous()
         logits = torch.gather(shift_probs, -1, shift_labels.unsqueeze(-1))
 
-    if isinstance(attention_mask, torch.Tensor):
+    # print(type(attention_mask))
+    # print(logits.shape)
+    # print(attention_mask.shape)
+
+    if isinstance(input_ids, torch.Tensor) and isinstance(
+            attention_mask, torch.Tensor):
         # batched
-        logits *= attention_mask[..., 1:]
+        logits *= attention_mask[..., None]
         logits = logits.cpu()
 
-    elif isinstance(attention_mask, AttentionBias):
+    elif isinstance(input_ids, list):
         # packed
         logits = logits.squeeze(0)
         logits = logits.cpu()
@@ -148,43 +153,47 @@ def worker_fn(model_path: str,
         # print(args)
         input_ids, input_lens, *args = args
 
-        if accel is None:
-            # pad and pack input ids
-            input_ids = [torch.tensor(p) for p in input_ids]
-            input_ids = pad_sequence(input_ids, batch_first=True)
-            input_ids = input_ids.cuda(gpu_id)
+        # if accel is None:
+        # pad and input ids
+        input_ids = [torch.tensor(p) for p in input_ids]
+        input_ids = pad_sequence(input_ids, batch_first=True)
+        input_ids = input_ids.cuda(gpu_id)
 
-            # attention_mask [bs, max_len]
-            max_len = max(input_lens)
-            assert max_len == input_ids.size(-1), \
-                f'input_ids.shape = {input_ids.shape}, max_len = {max_len}'
+        # attention_mask [bs, max_len]
+        max_len = max(input_lens)
+        assert max_len == input_ids.size(-1), \
+            f'input_ids.shape = {input_ids.shape}, max_len = {max_len}'
 
-            input_lens = torch.tensor(input_lens, device=gpu_id)
-            attention_mask = torch.arange(
-                max_len, device=gpu_id)[None, :] < input_lens[:, None]
+        input_lens = torch.tensor(input_lens, device=gpu_id)
+        attention_mask = torch.arange(
+            max_len, device=gpu_id)[None, :] < input_lens[:, None]
 
-            position_ids = None
-            assert attention_mask.shape == input_ids.shape, \
-                f'attention_mask.shape = {attention_mask.shape}'
+        #     position_ids = None
+        #     assert attention_mask.shape == input_ids.shape, \
+        #         f'attention_mask.shape = {attention_mask.shape}'
 
-        elif accel == 'replace_layer':
-            # pack input ids
-            input_ids = torch.tensor(sum(input_ids, [])).unsqueeze(0)
-            input_ids = input_ids.cuda(gpu_id)
-            # print(f"input_ids.shape = {input_ids.shape}")
-            # input_ids.shape == [1, pack_len]
+        # elif accel == 'replace_layer':
+        #     # pack input ids
+        #     input_ids = torch.tensor(sum(input_ids, [])).unsqueeze(0)
+        #     input_ids = input_ids.cuda(gpu_id)
+        #     # print(f"input_ids.shape = {input_ids.shape}")
+        #     # input_ids.shape == [1, pack_len]
 
-            # attention bias for xformers
-            attention_mask = BlockDiagonalMask.from_seqlens(
-                input_lens, input_lens).make_causal()
+        #     # attention bias for xformers
+        #     attention_mask = BlockDiagonalMask.from_seqlens(
+        #         input_lens, input_lens).make_causal()
 
-            position_ids = torch.cat(
-                [torch.arange(il, device=gpu_id) for il in input_lens])
-            position_ids = position_ids.unsqueeze(0)
+        #     position_ids = torch.cat(
+        #         [torch.arange(il, device=gpu_id) for il in input_lens])
+        #     position_ids = position_ids.unsqueeze(0)
 
         try:
-            logits = decode_single(model, input_ids, input_lens, position_ids,
-                                   attention_mask)
+            # print("attention_mask")
+            # print(attention_mask)
+            logits = decode_single(model=model,
+                                   input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   input_lens=input_lens)
         except torch.cuda.OutOfMemoryError:
             warnings.warn(
                 f'OOM on GPU {gpu_id}, discard prompts at indics {idx}.')
@@ -236,9 +245,10 @@ class Engine:
                  bytes_per_token=2e6,
                  max_bs: int = 1024):
 
-        gpu_ids, mem = avail_gpus(gpu_mem_percentage)
+        gpu_ids, mems = avail_gpus(gpu_mem_percentage)
+        mem = min(mems)
         print(f'Available GPUs are: {gpu_ids}, ', end='')
-        print(f'with {mem/2**30:.2f} GiB free.')
+        print(f'with minimum {mem/2**30:.2f} GiB free.')
 
         ctx = mp.get_context('spawn')
         inq = ctx.Queue()
@@ -304,10 +314,10 @@ class Engine:
 
         # sort to achieve better efficiency
         if sort:
-            pids_and_indicis = sorted(enumerate(token_ids),
-                                      key=lambda i_and_x: len(i_and_x[1]))
+            prompts_and_indicis = sorted(enumerate(token_ids),
+                                         key=lambda i_and_x: len(i_and_x[1]))
         else:
-            pids_and_indicis = list(enumerate(token_ids))
+            prompts_and_indicis = list(enumerate(token_ids))
 
         left = 0
         bs = self.max_bs
@@ -320,15 +330,18 @@ class Engine:
             right = min(left + bs, len(token_ids))
 
             # batch of prompts
-            sub_p_and_i = pids_and_indicis[left:right]
+            sub_p_and_i = prompts_and_indicis[left:right]
             idx, sub_p = zip(*sub_p_and_i)
 
             # batch of input_ids and attn_masks
-            # inputs = self.tokenizer(sub_p, return_tensors='pt', padding=True)
             input_ids = [torch.tensor(p) for p in sub_p]
-            input_ids = pad_sequence(input_ids,
-                                     batch_first=True,
-                                     padding_value=pad_token_id)
+            # attn_mask = [torch.ones_like(p) for p in sub_p]
+            # input_ids = pad_sequence(input_ids,
+            #                          batch_first=True,
+            #                          padding_value=pad_token_id)
+            # attn_mask = pad_sequence(attn_mask,
+            #                          batch_first=True,
+            #                          padding_value=0)
             input_lens = [len(p) for p in sub_p]
 
             # Dynamic batch size based on safe memory
@@ -387,7 +400,7 @@ class Engine:
     def __del__(self):
         print('Exiting engine ...')
         for _ in self.ps:
-            self.inq.put((None, None, None))
+            self.inq.put((None, None))
         for p in self.ps:
             p.join(timeout=1)
 

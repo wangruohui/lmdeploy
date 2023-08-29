@@ -85,4 +85,4 @@ class MemoryEfficientAttentionVarlen(nn.Module):
         output = output.reshape(bs, seqlen, self.hidden_size)
         output = self.o_proj(output)
 
-        return output, None, None
+        return output, None, None   # attn_weights, past_key_value
