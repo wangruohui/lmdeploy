@@ -34,7 +34,7 @@ def _test_decode_single(model_path, prompt):
     input_ids = inputs.input_ids.cuda()
     attention_mask = inputs.attention_mask.cuda()
 
-    probs: torch.Tensor = decode_single(model, input_ids, attention_mask)
+    probs: torch.Tensor = decode_single(model, input_ids, attention_mask=attention_mask)
 
     return probs.numpy()
 
@@ -58,9 +58,13 @@ def test_compare(output_outliers=True):
     rtol = 2.0e-2
     atol = 2.0e-2
     if output_outliers:
-        np.set_printoptions(linewidth=150, edgeitems=5)
+        np.set_printoptions(linewidth=200, edgeitems=5, precision=4, suppress=True)  # noqa: E501
         failed = (abs(p_dist - p_single) > atol + rtol * abs(p_single))
         idx = failed.nonzero()
+
+        print(p_dist)
+        print(p_single)
+
         print(f'Num outliers: {len(idx[0])}')
         print(p_dist[idx])
         print(p_single[idx])
